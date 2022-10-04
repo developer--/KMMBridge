@@ -1,20 +1,34 @@
 package co.touchlab.faktory
 
+import groovy.lang.Closure
 import org.apache.commons.codec.digest.DigestUtils
-import org.gradle.api.Plugin
-import org.gradle.api.Project
-import org.gradle.api.Task
-import org.gradle.api.UnknownTaskException
+import org.gradle.api.*
+import org.gradle.api.artifacts.Configuration
+import org.gradle.api.artifacts.PublishArtifact
+import org.gradle.api.artifacts.dsl.RepositoryHandler
+import org.gradle.api.artifacts.repositories.ArtifactRepository
+import org.gradle.api.artifacts.repositories.MavenArtifactRepository
+import org.gradle.api.attributes.Bundling
+import org.gradle.api.attributes.Category
+import org.gradle.api.attributes.LibraryElements
+import org.gradle.api.attributes.Usage
+import org.gradle.api.attributes.java.TargetJvmVersion
+import org.gradle.api.component.AdhocComponentWithVariants
+import org.gradle.api.component.ConfigurationVariantDetails
+import org.gradle.api.component.SoftwareComponentFactory
 import org.gradle.api.provider.ListProperty
 import org.gradle.api.provider.Property
-import org.gradle.api.tasks.*
+import org.gradle.api.publish.PublishingExtension
 import org.gradle.api.tasks.bundling.Zip
 import org.gradle.kotlin.dsl.*
-import org.jetbrains.kotlin.gradle.plugin.mpp.*
+import org.jetbrains.kotlin.gradle.plugin.mpp.Framework
+import org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget
+import org.jetbrains.kotlin.gradle.plugin.mpp.NativeBuildType
 import org.jetbrains.kotlin.gradle.plugin.mpp.apple.XCFramework
 import org.jetbrains.kotlin.gradle.plugin.mpp.apple.XCFrameworkConfig
-import java.io.*
-import java.util.*
+import java.io.File
+import java.io.FileInputStream
+import javax.inject.Inject
 import javax.json.JsonObject
 
 interface FaktoryExtension {
@@ -36,6 +50,15 @@ interface FaktoryExtension {
     val faktoryReadKey: Property<String>
 
     val buildType: Property<NativeBuildType>
+
+    val zipFilePath: Property<File>
+
+    val zipTask: Property<Task>
+
+    val repo: Property<ArtifactRepository>
+
+    fun artifacts(): MutableList<PublishArtifact> =
+        mutableListOf(FaktoryArtifact(zipFilePath, zipTask))
 
     fun s3Public(
         region: String,
@@ -92,20 +115,30 @@ interface ArtifactManager {
     /**
      * Send the thing, and return a link to the thing...
      */
-    fun deployArtifact(project: Project, zipFilePath: File, remoteFileId: String):String
+    fun deployArtifact(project: Project, zipFilePath: File, remoteFileId: String): String
 }
 
 internal const val TASK_GROUP_NAME = "kmmbridge"
 private const val EXTENSION_NAME = "kmmbridge"
 
 @Suppress("unused")
-class KMMBridgePlugin : Plugin<Project> {
+class KMMBridgePlugin @Inject constructor(
+    private val softwareComponentFactory: SoftwareComponentFactory
+) : Plugin<Project> {
 
     override fun apply(project: Project): Unit = with(project) {
+        val adhoc: AdhocComponentWithVariants = softwareComponentFactory.adhoc("kmmbridge")
+        components.add(adhoc)
+        adhoc.addVariantsFromConfiguration(createOutgoingConfiguration()) {
+            val foo: ConfigurationVariantDetails = this
+            mapToMavenScope("runtime")
+        }
+
         val extension = extensions.create<FaktoryExtension>(EXTENSION_NAME)
         extension.dependencyManagers.convention(emptyList())
         extension.buildType.convention(NativeBuildType.DEBUG)
         extension.artifactManager.convention(FaktoryServerArtifactManager())
+        configureZipTask(extension)
 
         afterEvaluate {
             if (extension.xcFrameworkPath.orNull == null) {
@@ -113,7 +146,44 @@ class KMMBridgePlugin : Plugin<Project> {
             }
 
             configureDeploy()
+
+            if (extension.xcFrameworkPath.orNull == null) {
+                extension.zipTask.get().dependsOn(findXCFrameworkAssembleTask())
+            }
         }
+    }
+
+    private fun Project.configureZipTask(extension: FaktoryExtension) {
+        val zipFilePath = zipFilePath()
+
+        val zipTask: Task = task<Zip>("zipXCFramework") {
+            group = TASK_GROUP_NAME
+            from(
+                extension.xcFrameworkPath.getOrElse(
+                    "$buildDir/XCFrameworks/${extension.buildType.get().getName()}"
+                )
+            )
+            destinationDirectory.set(zipFilePath.parentFile)
+            archiveFileName.set(zipFilePath.name)
+        }
+
+        extension.zipFilePath.convention(zipFilePath)
+        extension.zipTask.convention(zipTask)
+    }
+
+    private fun Project.createOutgoingConfiguration(): Configuration {
+        val instrumentedJars by configurations.creating {
+            isCanBeConsumed = true
+            isCanBeResolved = false
+            attributes {
+                attribute(Category.CATEGORY_ATTRIBUTE, objects.named(Category.LIBRARY))
+                attribute(Usage.USAGE_ATTRIBUTE, objects.named(Usage.JAVA_RUNTIME))
+                attribute(Bundling.BUNDLING_ATTRIBUTE, objects.named(Bundling.EXTERNAL))
+                attribute(TargetJvmVersion.TARGET_JVM_VERSION_ATTRIBUTE, JavaVersion.current().majorVersion.toInt())
+                attribute(LibraryElements.LIBRARY_ELEMENTS_ATTRIBUTE, objects.named("instrumented-jar"))
+            }
+        }
+        return instrumentedJars
     }
 
     private fun valueOrEmpty(jsonObject: JsonObject, fieldName: String): String =
@@ -164,38 +234,38 @@ class KMMBridgePlugin : Plugin<Project> {
 
     private fun Project.configureDeploy() {
         val extension = extensions.getByType<FaktoryExtension>()
-
-        val jbXcFrameworkBuild = extension.xcFrameworkPath.orNull == null
-
-        val xcFrameworkPath = extension.xcFrameworkPath
-            .getOrElse("$buildDir/XCFrameworks/${extension.buildType.get().getName()}")
         val artifactManager = extension.artifactManager.get()
-        val zipFile = zipFilePath()
+        val zipFile = extension.zipFilePath.get()
 
-        val zipTask = task<Zip>("zipXCFramework") {
-            group = TASK_GROUP_NAME
-            if (jbXcFrameworkBuild) {
-                dependsOn(findXCFrameworkAssembleTask())
-            }
+        val publishing = extensions.getByType<PublishingExtension>()
+        val repo = publishing.repositories.findByName("myRepo")  // Get this from our own extension properties
+        val myRepo = repo as MavenArtifactRepository
+        val deployUrl = buildString {
+            // Repo URL
+            append(myRepo.url)
 
-            from(xcFrameworkPath)
-            destinationDirectory.set(zipFile.parentFile)
-            archiveFileName.set(zipFile.name)
+            // Artifact path
+            append(group.toString().replace(".", "/"))
+                .append("/").append(name)
+                .append("/").append(version)
+
+            // Artifact filename
+            append("/").append(name).append("-").append(version).append(".zip")
         }
 
         val dependencyManagers = extension.dependencyManagers.get()
         val uploadTask = task("uploadXCFramework") {
             group = TASK_GROUP_NAME
 
-            dependsOn(zipTask)
+            dependsOn(extension.zipTask.get())
             inputs.file(zipFile)
             outputs.file(project.urlFile)
 
             doLast {
-                val deployUrl = with(artifactManager) {
-                    val remoteFileId = computeRemoteFileId(zipFile)
-                    deployArtifact(project, zipFile, remoteFileId)
-                }
+//                val deployUrl = with(artifactManager) {
+//                    val remoteFileId = computeRemoteFileId(zipFile)
+//                    deployArtifact(project, zipFile, remoteFileId)
+//                }
 
                 prepWriteFaktoryFiles(project) {
                     project.urlFile.writeText(deployUrl)

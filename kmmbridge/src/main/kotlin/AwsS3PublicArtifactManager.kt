@@ -20,7 +20,7 @@ class AwsS3PublicArtifactManager(
 ) : ArtifactManager {
 
     override fun deployArtifact(project: Project, zipFilePath: File, remoteFileId: String): String {
-        uploadArtifact(project, zipFilePath, remoteFileId)
+        // uploadArtifact(project, zipFilePath, remoteFileId)
         return deployUrl(project, remoteFileId)
     }
 
